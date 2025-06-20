@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>Gerenciador de Senhas · Dark</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{
+  --bg:#202225;--bg-alt:#2f3136;--border:#444;
+  --text:#e3e5e8;--text-dim:#b9bbbe;
+  --accent:#5865f2;--accent-hover:#4752c4;
+  --danger:#f04747;
+}
+*{box-sizing:border-box;font-family:Inter,system-ui,Segoe UI,Roboto,sans-serif}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text);overflow:hidden}
+button,input,select{font-size:.9rem;color:var(--text);background:var(--bg-alt);border:1px solid var(--border);padding:6px 10px;border-radius:4px}
+button:hover{background:var(--accent-hover);border-color:var(--accent-hover)}
+input,select{width:100%}
+#topbar{height:48px;background:#2b2d31;display:flex;align-items:center;padding:0 14px;border-bottom:1px solid var(--border)}
+#columns{display:flex;height:calc(100% - 48px);overflow-x:auto}
+.column{min-width:240px;max-width:260px;background:var(--bg-alt);border-right:1px solid var(--border);padding:6px 0;overflow-y:auto}
+.item{padding:6px 12px;cursor:pointer;display:flex;align-items:center;gap:8px}
+.item:hover{background:rgba(255,255,255,.05)}
+.item.new{color:var(--accent)}
+.item.site::before{content:"🔑 ";margin-right:2px}
+.item.env::before{content:"📂 ";margin-right:2px}
+.title{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ctrl{display:none;font-weight:700;cursor:pointer}
+.item:hover .ctrl{display:inline}
+.ctrl.del{color:var(--danger)}
+.ctrl.ren{color:var(--accent)}
+.modalBackdrop{position:fixed;inset:0;background:#0008;display:flex;align-items:center;justify-content:center;z-index:100}
+.modal{background:var(--bg-alt);padding:20px;width:100%;max-width:480px;border-radius:8px}
+.modal h3{margin-top:0}
+.hRow{display:flex;gap:6px;margin-bottom:8px}
+.hRow input{flex:1}
+.hintRow{display:flex;gap:6px;margin-bottom:6px}
+.hintRow input{flex:1}
+.hintAdd{cursor:pointer;color:var(--accent);font-weight:600}
+hr{border:0;border-top:1px solid var(--border);margin:12px 0}
+</style>
+</head>
+<body>
+
+<header id="topbar">
+  Algoritmo:&nbsp;<select disabled><option>SHA-256</option></select>
+  <button id="btnNewCfg" style="margin-left:auto">Novo (padrão)</button>
+  <button id="btnSaveCfg" style="margin-left:8px">Salvar</button>
+  <button id="btnLoadCfg" style="margin-left:8px">Carregar</button>
+  <input type="file" id="filePick" accept=".pmcfg" hidden>
+</header>
+
+<main id="columns"></main>
+
+<script type="module">
+/*────────── util ──────────*/
+const WORDS=["neon","orquestra","fóton","geode","lótus","quasar","tâmara","zenite","boreal","cósmico","delta","épico","flor","galáxia","hélice","ígneo","jade","kiwi","lima","magma","nuvem","óasis","pólen","química","rune","sílex","tango","umbra","vítreo","xisto","yoga","zéfiro"];
+const enc=new TextEncoder,dec=new TextDecoder;
+const base62="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+const qs=s=>document.querySelector(s);
+function rndWord(){return WORDS[crypto.getRandomValues(new Uint32Array(1))[0]%WORDS.length];}
+function b62(buf,len){const a=[];for(const b of new Uint8Array(buf)){a.push(base62[b%62]);if(a.length===len)break;}return a.join("")}
+async function derivePwd(seed,len){let out="",i=0;while(out.length<len){const h=await crypto.subtle.digest("SHA-256",enc.encode(seed+"#"+i++));out+=b62(h,len-out.length);}return out.slice(0,len);}
+
+/*────────── AES-GCM p/ arquivo ──────────*/
+async function keyFromPass(pw,s){const km=await crypto.subtle.importKey("raw",enc.encode(pw),"PBKDF2",false,["deriveKey"]);
+return crypto.subtle.deriveKey({name:"PBKDF2",salt:s,iterations:100000,hash:"SHA-256"},km,{name:"AES-GCM",length:256},false,["encrypt","decrypt"])}
+async function encCfg(o,pw){const s=crypto.getRandomValues(new Uint8Array(16)),iv=crypto.getRandomValues(new Uint8Array(12)),k=await keyFromPass(pw,s),c=await crypto.subtle.encrypt({name:"AES-GCM",iv},k,enc.encode(JSON.stringify(o)));
+const out=new Uint8Array(s.length+iv.length+c.byteLength);out.set(s);out.set(iv,16);out.set(new Uint8Array(c),28);return out;}
+async function decCfg(b,pw){const s=b.slice(0,16),iv=b.slice(16,28),c=b.slice(28),k=await keyFromPass(pw,s),p=await crypto.subtle.decrypt({name:"AES-GCM",iv},k,c);return JSON.parse(dec.decode(p));}
+
+/*────────── dados ──────────*/
+let cfg;
+function defaultCfg(){return{created:Date.now(),children:{default:{name:"default",security:0,children:{},sites:{}}}}}
+let envCounter=0;const nextEnv=()=>String.fromCharCode(97+envCounter++);
+
+/*────────── colunas ──────────*/
+function clearCols(n=0){const c=qs("#columns");while(c.children.length>n)c.removeChild(c.lastChild);}
+function renderCol(node,lv,parent){
+  const col=document.createElement("div");col.className="column";qs("#columns").appendChild(col);
+
+  /* ambientes */
+  for(const [key,env] of Object.entries(node.children||{})){
+    const div=document.createElement("div");div.className="item env";
+    const titleSpan=document.createElement("span");titleSpan.className="title";titleSpan.textContent=env.name;
+    const ren=document.createElement("span");ren.textContent="✎";ren.className="ctrl ren";
+    const del=document.createElement("span");del.textContent="×";del.className="ctrl del";
+
+    /* rename inline */
+    ren.onclick=e=>{
+      e.stopPropagation();
+      const input=document.createElement("input");input.value=env.name;input.style.width="100%";
+      div.replaceChild(input,titleSpan);input.focus();input.select();
+      const finish=(ok)=>{
+        const val=input.value.trim()||env.name;
+        if(ok&&val!==env.name){
+          env.name=val;node.children[val]=env;delete node.children[key];
+        }
+        div.replaceChild(titleSpan,input);titleSpan.textContent=env.name;
+      };
+      input.onkeydown=ev=>{if(ev.key==="Enter")finish(true);if(ev.key==="Escape")finish(false)};
+      input.onblur=()=>finish(true);
+    };
+
+    del.onclick=e=>{e.stopPropagation();if(confirm("Apagar ambiente?")){delete node.children[key];clearCols(lv);renderCol(node,lv,parent);}};
+
+    div.onclick=()=>{clearCols(lv+1);renderCol(env,lv+1,env)};
+    div.append(titleSpan,ren,del);
+    col.appendChild(div);
+  }
+
+  /* sites */
+  Object.entries(node.sites||{}).forEach(([sKey,site])=>{
+    const div=document.createElement("div");div.className="item site";
+    const title=document.createElement("span");title.className="title";title.textContent=site.name;
+    const ren=document.createElement("span");ren.textContent="✎";ren.className="ctrl ren";
+    const del=document.createElement("span");del.textContent="×";del.className="ctrl del";
+
+    ren.onclick=e=>{e.stopPropagation();openEditSiteModal(site,node,sKey);};
+    del.onclick=e=>{e.stopPropagation();if(confirm("Apagar site?")){delete node.sites[sKey];clearCols(lv);renderCol(node,lv,parent);}};
+
+    div.onclick=()=>openSiteModal(site,node);
+    div.append(title,ren,del);
+    col.appendChild(div);
+  });
+
+  /* “novo” */
+  const nEnv=document.createElement("div");nEnv.className="item new";nEnv.textContent="+ novo ambiente";
+  nEnv.onclick=()=>{const nm=nextEnv();node.children??={};node.children[nm]={name:nm,security:1,children:{},sites:{}};clearCols(lv);renderCol(node,lv,parent);};
+  const nSite=document.createElement("div");nSite.className="item new";nSite.textContent="+ novo site";
+  nSite.onclick=()=>openNewSiteModal(node);
+  col.append(nEnv,nSite);
+}
+function renderRoot(){qs("#columns").innerHTML="";renderCol(cfg,0,cfg);}
+
+/*────────── modal helper ──────────*/
+function modal(html){
+  const b=document.createElement("div");b.className="modalBackdrop";
+  const m=document.createElement("div");m.className="modal";m.innerHTML=html;b.appendChild(m);
+  b.onclick=e=>{if(e.target===b)b.remove();};document.body.appendChild(b);return m;
+}
+
+/*────────── criar & editar site ──────────*/
+function buildSiteForm(site={}){
+return `
+<div class="hRow"><input id="inSite" placeholder="URL/domínio" value="${site.name||""}"></div>
+<div class="hRow"><input id="inLogin" placeholder="Usuário (login)" value="${site.login||""}"></div>
+<div class="hRow"><input id="inMnemonic" placeholder="Nome mnemônico" value="${site.mnemonic||""}"></div>
+<div class="hRow"><input id="inBase" type="password" placeholder="Senha base" value="${site.base||""}"></div>
+<div class="hRow"><input id="inLen" type="number" min="8" max="64" value="${site.len||16}"></div>
+<hr><h4>Dicas</h4><div id="hintList"></div>
+<div class="hintRow hintAdd" id="addHint">+ adicionar palavra</div>`;}
+function fillHints(list,hints){list.innerHTML="";hints.forEach(c=>{const r=document.createElement("div");r.className="hintRow";r.innerHTML=`<input value="${c}" placeholder="dica">`;list.appendChild(r);});}
+function collectHints(list){return [...list.children].map(r=>r.children[0].value.trim()).filter(Boolean);}
+
+function openNewSiteModal(parent){
+  const m=modal(`<h3>Novo Site</h3>${buildSiteForm()}<button id="btnCreate" style="margin-top:6px;width:100%">Criar</button>`);
+  const hl=m.querySelector("#hintList");fillHints(hl,[rndWord()]);
+  m.querySelector("#addHint").onclick=()=>fillHints(hl,[...collectHints(hl),rndWord()]);
+  m.querySelector("#btnCreate").onclick=()=>{
+    const name=m.querySelector("#inSite").value.trim();if(!name)return alert("Site obrigatório");
+    parent.sites??={};
+    parent.sites[name]={name,login:m.querySelector("#inLogin").value.trim(),mnemonic:m.querySelector("#inMnemonic").value.trim()||name,base:m.querySelector("#inBase").value,len:parseInt(m.querySelector("#inLen").value)||16,hints:collectHints(hl)};
+    m.parentNode.remove();renderRoot();
+  };
+}
+
+function openEditSiteModal(site,parent,key){
+  const m=modal(`<h3>Editar Site</h3>${buildSiteForm(site)}<button id="btnSave" style="margin-top:6px;width:100%">Salvar</button>`);
+  const hl=m.querySelector("#hintList");fillHints(hl,site.hints);
+  m.querySelector("#addHint").onclick=()=>fillHints(hl,[...collectHints(hl),rndWord()]);
+  m.querySelector("#btnSave").onclick=()=>{
+    const newName=m.querySelector("#inSite").value.trim();if(!newName)return alert("Site obrigatório");
+    const newSite={name:newName,login:m.querySelector("#inLogin").value.trim(),mnemonic:m.querySelector("#inMnemonic").value.trim()||newName,base:m.querySelector("#inBase").value,len:parseInt(m.querySelector("#inLen").value)||16,hints:collectHints(hl)};
+    delete parent.sites[key];parent.sites[newName]=newSite;
+    m.parentNode.remove();renderRoot();
+  };
+}
+
+/*────────── modal site view ──────────*/
+function openSiteModal(site,parent){
+  const m=modal(`<h3>${site.name}</h3>
+  <p>Usuário: <b>${site.login||"<i>(não salvo)</i>"}</b></p>
+  <p>Senha base: <b>${site.base?"✔":"—"}</b></p>
+  <p>Tamanho: <b>${site.len} car.</b></p>
+  <h4>Dicas</h4><ul>${site.hints.map(c=>`<li>${c}</li>`).join("")}</ul>
+  <button id="btnGen" style="width:100%;margin-top:8px">Gerar senha forte</button>`);
+  m.querySelector("#btnGen").onclick=()=>openGenerateModal(site,m.parentNode);
+}
+
+/*────────── gerar senha ──────────*/
+function openGenerateModal(site,oldBack){
+  const m=modal(`
+    <h3>Associações</h3>
+    <div class="hRow"><input id="basePwd" type="password" placeholder="Senha base"></div>
+    <div id="assocList"></div>
+    <button id="ok" style="width:100%;margin-top:8px">Copiar senha</button>`);
+  if(oldBack)oldBack.remove();
+
+  /* preencher dicas ► campos de associação */
+  const al=m.querySelector("#assocList");
+  site.hints.forEach(c=>{
+    const r=document.createElement("div");r.className="hRow";
+    r.innerHTML=`<span style="min-width:80px">${c}</span><input placeholder="associação">`;
+    al.appendChild(r);
+  });
+
+  /* processar */
+  m.querySelector("#ok").onclick=async()=>{
+    const base=m.querySelector("#basePwd").value;
+    if(!base)return alert("Digite a senha base.");
+    const assocs=[...al.querySelectorAll("input")].map(i=>i.value.trim());
+    if(assocs.some(a=>!a))return alert("Preencha todas as associações.");
+
+    const seed=[
+      site.name,
+      site.login,
+      site.mnemonic,
+      base,                     // ► senha-base digitada AGORA
+      site.hints.join("|"),
+      assocs.join("|")
+    ].join("§");
+
+    const pwd=await derivePwd(seed,site.len);
+    await navigator.clipboard.writeText(pwd);
+    alert("Senha copiada ✅");
+    m.parentNode.remove();
+  };
+}
+
+/*────────── salvar/carregar, helpers ──────────*/
+qs("#btnNewCfg").onclick=()=>{cfg=defaultCfg();envCounter=0;renderRoot();};
+qs("#btnSaveCfg").onclick=async()=>{if(!cfg)return;const pw=prompt("Senha p/ criptografar:");if(!pw)return;
+  const blob=await encCfg(cfg,pw),url=URL.createObjectURL(new Blob([blob],{type:"octet/stream"}));
+  const a=document.createElement("a");a.href=url;a.download="senhas.pmcfg";a.click();URL.revokeObjectURL(url);};
+qs("#btnLoadCfg").onclick=()=>qs("#filePick").click();
+qs("#filePick").onchange=async e=>{const f=e.target.files[0];if(!f)return;const pw=prompt("Senha do arquivo:");if(!pw)return;
+  try{cfg=await decCfg(new Uint8Array(await f.arrayBuffer()),pw);envCounter=0;renderRoot();}
+  catch(err){alert("Erro: "+err.message);}};
+
+/*────────── init ──────────*/
+cfg=defaultCfg();renderRoot();
+</script>
+</body>
+</html>
