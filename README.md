@@ -129,9 +129,7 @@ Compatibilidade mínima: **Chrome 87+ / Firefox 78+ / Edge 88+**.
 
 | Status | Item                                             |
 | ------ | ------------------------------------------------ |
-| ☐      | Sincronização via Web DAV ou Drive               |
 | ☐      | Versão PWA (instalável)                          |
-| ☐      | Modo-claro togglável                             |
 | ☐      | Importação de listas BIP-39 completas para dicas |
 
 ---
